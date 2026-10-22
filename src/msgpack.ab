@@ -1,0 +1,458 @@
+// MessagePack (https://msgpack.org/ spec, 2017 revision): a streaming writer
+// and reader, and a value tree built on them.
+//
+// Integers are written in their smallest form (positive values as uint*,
+// negative as int*). Abla `int` is 64-bit signed: uint64 values at or above
+// 2^63 are carried as their bit pattern with `unsigned` set.
+
+import "abla/bytes"
+import "abla/float"
+
+val MSGPACK_NIL = 0
+val MSGPACK_BOOL = 1
+val MSGPACK_INT = 2
+val MSGPACK_FLOAT = 3
+val MSGPACK_STR = 4
+val MSGPACK_BIN = 5
+val MSGPACK_ARRAY = 6
+val MSGPACK_MAP = 7
+val MSGPACK_EXT = 8
+
+// --- writer -----------------------------------------------------------------
+
+class MsgpackWriter(var out: ByteBuffer)
+
+fun msgpackWriter(): MsgpackWriter = MsgpackWriter(byteBuffer())
+
+fun MsgpackWriter.byte(value: int): void {
+    this.out.appendByteValue(value & 255)
+    return
+}
+
+// big-endian, `count` bytes
+fun MsgpackWriter.big(value: int, count: int): void {
+    var shift = (count - 1) * 8
+    while (shift >= 0) {
+        this.byte((value >> shift) & 255)
+        shift -= 8
+    }
+    return
+}
+
+fun MsgpackWriter.writeNil(): void = this.byte(192)
+
+fun MsgpackWriter.writeBool(value: bool): void = this.byte(if (value) 195 else 194)
+
+fun MsgpackWriter.writeInt(value: int): void {
+    if (value >= 0) {
+        if (value < 128) this.byte(value)
+        else if (value < 256) {
+            this.byte(204)
+            this.byte(value)
+        } else if (value < 65536) {
+            this.byte(205)
+            this.big(value, 2)
+        } else if (value < 4294967296) {
+            this.byte(206)
+            this.big(value, 4)
+        } else {
+            this.byte(207)
+            this.big(value, 8)
+        }
+    } else if (value >= -32) this.byte(224 | (value + 32))
+    else if (value >= -128) {
+        this.byte(208)
+        this.byte(value)
+    } else if (value >= -32768) {
+        this.byte(209)
+        this.big(value, 2)
+    } else if (value >= -2147483648) {
+        this.byte(210)
+        this.big(value, 4)
+    } else {
+        this.byte(211)
+        this.big(value, 8)
+    }
+    return
+}
+
+// an unsigned 64-bit value from its bit pattern (uint64 for the high half)
+fun MsgpackWriter.writeUint(bits: int): void {
+    if (bits >= 0) {
+        this.writeInt(bits)
+        return
+    }
+    this.byte(207)
+    this.big(bits, 8)
+    return
+}
+
+fun MsgpackWriter.writeFloat64(value: f64): void {
+    this.byte(203)
+    this.big(f64ToBits(value), 8)
+    return
+}
+
+fun MsgpackWriter.writeFloat32(value: f64): void {
+    this.byte(202)
+    this.big(int(f32ToBits(f64ToF32(value))), 4)
+    return
+}
+
+fun MsgpackWriter.writeStrHeader(count: int): void {
+    if (count < 32) this.byte(160 + count)
+    else if (count < 256) {
+        this.byte(217)
+        this.byte(count)
+    } else if (count < 65536) {
+        this.byte(218)
+        this.big(count, 2)
+    } else {
+        this.byte(219)
+        this.big(count, 4)
+    }
+    return
+}
+
+// UTF-8 text, as str
+fun MsgpackWriter.writeStr(text: string): void {
+    this.writeStrHeader(text.size)
+    this.out.appendText(text)
+    return
+}
+
+fun MsgpackWriter.writeBinHeader(count: int): void {
+    if (count < 256) {
+        this.byte(196)
+        this.byte(count)
+    } else if (count < 65536) {
+        this.byte(197)
+        this.big(count, 2)
+    } else {
+        this.byte(198)
+        this.big(count, 4)
+    }
+    return
+}
+
+// raw bytes, as bin
+fun MsgpackWriter.writeBin(data: string): void {
+    this.writeBinHeader(data.size)
+    this.out.appendText(data)
+    return
+}
+
+// appends already-encoded bytes (a bin or str body after its header)
+fun MsgpackWriter.writeRaw(data: string): void {
+    this.out.appendText(data)
+    return
+}
+
+fun MsgpackWriter.writeArrayHeader(count: int): void {
+    if (count < 16) this.byte(144 + count)
+    else if (count < 65536) {
+        this.byte(220)
+        this.big(count, 2)
+    } else {
+        this.byte(221)
+        this.big(count, 4)
+    }
+    return
+}
+
+fun MsgpackWriter.writeMapHeader(count: int): void {
+    if (count < 16) this.byte(128 + count)
+    else if (count < 65536) {
+        this.byte(222)
+        this.big(count, 2)
+    } else {
+        this.byte(223)
+        this.big(count, 4)
+    }
+    return
+}
+
+// ext: fixext for 1/2/4/8/16 bytes, else ext8/16/32; type is -128..127
+fun MsgpackWriter.writeExt(type: int, data: string): void {
+    val n = data.size
+    if (n == 1) this.byte(212)
+    else if (n == 2) this.byte(213)
+    else if (n == 4) this.byte(214)
+    else if (n == 8) this.byte(215)
+    else if (n == 16) this.byte(216)
+    else if (n < 256) {
+        this.byte(199)
+        this.byte(n)
+    } else if (n < 65536) {
+        this.byte(200)
+        this.big(n, 2)
+    } else {
+        this.byte(201)
+        this.big(n, 4)
+    }
+    this.byte(type)
+    this.out.appendText(data)
+    return
+}
+
+fun MsgpackWriter.size(): int = this.out.size()
+
+fun MsgpackWriter.bytes(): string = this.out.toText()
+
+// --- reader -----------------------------------------------------------------
+
+// One item: a scalar, or an array / map header with its `count` (the caller
+// reads that many items, or 2 * count for a map). text: str / bin / ext data.
+class MsgpackToken(
+    var kind: int = 0,
+    var boolean: bool = false,
+    var integer: int = 0,
+    var unsigned: bool = false,
+    var float: f64 = 0.0,
+    var float32: bool = false,
+    var text: string = "",
+    var extType: int = 0,
+    var count: int = 0
+)
+
+class MsgpackReader(var data: string, var at: int, var failed: bool, var error: string)
+
+fun msgpackReader(data: string): MsgpackReader = MsgpackReader(data, 0, false, "")
+
+fun MsgpackReader.fail(message: string): void {
+    if (!this.failed) {
+        this.failed = true
+        this.error = message
+    }
+    return
+}
+
+fun MsgpackReader.atEnd(): bool = this.at >= this.data.size
+
+fun MsgpackReader.readByte(): int {
+    if (this.at >= this.data.size) {
+        this.fail("unexpected end at ${this.at}")
+        return 0
+    }
+    val b = this.data[this.at]
+    this.at += 1
+    b
+}
+
+fun MsgpackReader.big(count: int): int {
+    var v = 0
+    var i = 0
+    while (i < count) {
+        v = (v << 8) | this.readByte()
+        i += 1
+    }
+    v
+}
+
+fun MsgpackReader.signed(count: int): int {
+    val v = this.big(count)
+    val bits = count * 8
+    if (bits < 64 && ((v >> (bits - 1)) & 1) == 1) v - (1 << bits) else v
+}
+
+fun MsgpackReader.take(count: int): string {
+    if (count < 0 || this.at + count > this.data.size) {
+        this.fail("length $count past the end at ${this.at}")
+        return ""
+    }
+    val s = this.data.slice(this.at, this.at + count)
+    this.at += count
+    s
+}
+
+fun __msgpackInt(value: int, unsigned: bool): MsgpackToken = MsgpackToken(MSGPACK_INT, integer = value, unsigned = unsigned)
+
+fun MsgpackReader.ext(count: int): MsgpackToken {
+    val type = this.signed(1)
+    MsgpackToken(MSGPACK_EXT, text = this.take(count), extType = type)
+}
+
+// the next item (kind MSGPACK_NIL with `failed` set on bad input)
+fun MsgpackReader.next(): MsgpackToken {
+    val b = this.readByte()
+    if (this.failed) return MsgpackToken()
+    if (b < 128) return __msgpackInt(b, false)
+    if (b >= 224) return __msgpackInt(b - 256, false)
+    if (b < 144) return MsgpackToken(MSGPACK_MAP, count = b - 128)
+    if (b < 160) return MsgpackToken(MSGPACK_ARRAY, count = b - 144)
+    if (b < 192) return MsgpackToken(MSGPACK_STR, text = this.take(b - 160))
+    when (b) {
+        192 -> return MsgpackToken()
+        194 -> return MsgpackToken(MSGPACK_BOOL, boolean = false)
+        195 -> return MsgpackToken(MSGPACK_BOOL, boolean = true)
+        196 -> return MsgpackToken(MSGPACK_BIN, text = this.take(this.big(1)))
+        197 -> return MsgpackToken(MSGPACK_BIN, text = this.take(this.big(2)))
+        198 -> return MsgpackToken(MSGPACK_BIN, text = this.take(this.big(4)))
+        199 -> return this.ext(this.big(1))
+        200 -> return this.ext(this.big(2))
+        201 -> return this.ext(this.big(4))
+        202 -> return MsgpackToken(MSGPACK_FLOAT, float = f32ToF64(f32FromBits(u32(this.big(4)))), float32 = true)
+        203 -> return MsgpackToken(MSGPACK_FLOAT, float = f64FromBits(this.big(8)))
+        204 -> return __msgpackInt(this.big(1), false)
+        205 -> return __msgpackInt(this.big(2), false)
+        206 -> return __msgpackInt(this.big(4), false)
+        207 -> {
+            val v = this.big(8)
+            return __msgpackInt(v, v < 0)
+        }
+        208 -> return __msgpackInt(this.signed(1), false)
+        209 -> return __msgpackInt(this.signed(2), false)
+        210 -> return __msgpackInt(this.signed(4), false)
+        211 -> return __msgpackInt(this.signed(8), false)
+        212 -> return this.ext(1)
+        213 -> return this.ext(2)
+        214 -> return this.ext(4)
+        215 -> return this.ext(8)
+        216 -> return this.ext(16)
+        217 -> return MsgpackToken(MSGPACK_STR, text = this.take(this.big(1)))
+        218 -> return MsgpackToken(MSGPACK_STR, text = this.take(this.big(2)))
+        219 -> return MsgpackToken(MSGPACK_STR, text = this.take(this.big(4)))
+        220 -> return MsgpackToken(MSGPACK_ARRAY, count = this.big(2))
+        221 -> return MsgpackToken(MSGPACK_ARRAY, count = this.big(4))
+        222 -> return MsgpackToken(MSGPACK_MAP, count = this.big(2))
+        223 -> return MsgpackToken(MSGPACK_MAP, count = this.big(4))
+        else -> {
+            // 0xc1 is never used
+            this.fail("reserved byte 193 at ${this.at - 1}")
+            return MsgpackToken()
+        }
+    }
+}
+
+// skips one whole item (nested arrays and maps included)
+fun MsgpackReader.skip(): void {
+    var left = 1
+    while (left > 0 && !this.failed) {
+        val t = this.next()
+        left -= 1
+        if (t.kind == MSGPACK_ARRAY) left += t.count
+        else if (t.kind == MSGPACK_MAP) left += t.count * 2
+    }
+    return
+}
+
+// --- values -----------------------------------------------------------------
+
+// A decoded item: map entries are `keys[i]` -> `items[i]`; text: str / bin / ext data.
+class MsgpackValue(
+    var kind: int = 0,
+    var boolean: bool = false,
+    var integer: int = 0,
+    var unsigned: bool = false,
+    var float: f64 = 0.0,
+    var float32: bool = false,
+    var text: string = "",
+    var extType: int = 0,
+    var items: array<MsgpackValue> = [],
+    var keys: array<MsgpackValue> = []
+)
+
+fun msgpackNil(): MsgpackValue = MsgpackValue()
+fun msgpackBool(value: bool): MsgpackValue = MsgpackValue(MSGPACK_BOOL, boolean = value)
+fun msgpackInt(value: int): MsgpackValue = MsgpackValue(MSGPACK_INT, integer = value)
+fun msgpackUint(bits: int): MsgpackValue = MsgpackValue(MSGPACK_INT, integer = bits, unsigned = bits < 0)
+fun msgpackFloat64(value: f64): MsgpackValue = MsgpackValue(MSGPACK_FLOAT, float = value)
+fun msgpackFloat32(value: f64): MsgpackValue = MsgpackValue(MSGPACK_FLOAT, float = f32ToF64(f64ToF32(value)), float32 = true)
+fun msgpackStr(text: string): MsgpackValue = MsgpackValue(MSGPACK_STR, text = text)
+fun msgpackBin(data: string): MsgpackValue = MsgpackValue(MSGPACK_BIN, text = data)
+fun msgpackArray(items: array<MsgpackValue>): MsgpackValue = MsgpackValue(MSGPACK_ARRAY, items = items)
+fun msgpackMap(keys: array<MsgpackValue>, values: array<MsgpackValue>): MsgpackValue = MsgpackValue(MSGPACK_MAP, items = values, keys = keys)
+fun msgpackExt(type: int, data: string): MsgpackValue = MsgpackValue(MSGPACK_EXT, text = data, extType = type)
+
+fun MsgpackValue.isNil(): bool = this.kind == MSGPACK_NIL
+
+// the value for a str key ("" kinds never match), else nil
+fun MsgpackValue.field(key: string): MsgpackValue {
+    var i = 0
+    while (i < this.keys.size) {
+        if (this.keys[i].kind == MSGPACK_STR && this.keys[i].text == key) return __msgpackCopy(this.items[i])
+        i += 1
+    }
+    msgpackNil()
+}
+
+fun __msgpackCopy(v: MsgpackValue): MsgpackValue {
+    var items: array<MsgpackValue> = []
+    for (x in v.items) items.append(__msgpackCopy(x))
+    var keys: array<MsgpackValue> = []
+    for (x in v.keys) keys.append(__msgpackCopy(x))
+    MsgpackValue(v.kind, v.boolean, v.integer, v.unsigned, v.float, v.float32, v.text.slice(0, v.text.size), v.extType, items, keys)
+}
+
+fun MsgpackWriter.writeValue(v: MsgpackValue): void {
+    when (v.kind) {
+        MSGPACK_NIL -> this.writeNil()
+        MSGPACK_BOOL -> this.writeBool(v.boolean)
+        MSGPACK_INT -> if (v.unsigned) this.writeUint(v.integer) else this.writeInt(v.integer)
+        MSGPACK_FLOAT -> if (v.float32) this.writeFloat32(v.float) else this.writeFloat64(v.float)
+        MSGPACK_STR -> this.writeStr(v.text)
+        MSGPACK_BIN -> this.writeBin(v.text)
+        MSGPACK_ARRAY -> {
+            this.writeArrayHeader(v.items.size)
+            for (x in v.items) this.writeValue(x)
+        }
+        MSGPACK_MAP -> {
+            this.writeMapHeader(v.items.size)
+            var i = 0
+            while (i < v.items.size) {
+                this.writeValue(v.keys[i])
+                this.writeValue(v.items[i])
+                i += 1
+            }
+        }
+        else -> this.writeExt(v.extType, v.text)
+    }
+    return
+}
+
+fun msgpackEncodeValue(v: MsgpackValue): string {
+    var w = msgpackWriter()
+    w.writeValue(v)
+    w.bytes()
+}
+
+class MsgpackDecodeResult(var ok: bool = false, var value: MsgpackValue = MsgpackValue(), var error: string = "")
+
+fun MsgpackReader.readValue(depth: int, maxDepth: int): MsgpackValue {
+    if (depth > maxDepth) {
+        this.fail("nested deeper than $maxDepth")
+        return msgpackNil()
+    }
+    val t = this.next()
+    if (this.failed) return msgpackNil()
+    if (t.kind == MSGPACK_ARRAY) {
+        var items: array<MsgpackValue> = []
+        var i = 0
+        while (i < t.count && !this.failed) {
+            items.append(this.readValue(depth + 1, maxDepth))
+            i += 1
+        }
+        return msgpackArray(items)
+    }
+    if (t.kind == MSGPACK_MAP) {
+        var keys: array<MsgpackValue> = []
+        var values: array<MsgpackValue> = []
+        var i = 0
+        while (i < t.count && !this.failed) {
+            keys.append(this.readValue(depth + 1, maxDepth))
+            values.append(this.readValue(depth + 1, maxDepth))
+            i += 1
+        }
+        return msgpackMap(keys, values)
+    }
+    MsgpackValue(t.kind, t.boolean, t.integer, t.unsigned, t.float, t.float32, t.text, t.extType)
+}
+
+// exactly one item; extra bytes after it fail
+fun msgpackDecodeValue(data: string, maxDepth: int = 512): MsgpackDecodeResult {
+    var r = msgpackReader(data)
+    val v = r.readValue(0, maxDepth)
+    if (!r.failed && !r.atEnd()) r.fail("${data.size - r.at} extra bytes after the value")
+    if (r.failed) return MsgpackDecodeResult(false, msgpackNil(), r.error)
+    MsgpackDecodeResult(true, v)
+}

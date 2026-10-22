@@ -1,0 +1,115 @@
+// MessagePack fixtures: each value's bytes (from the spec's formats) and back.
+
+import "abla/io"
+import "abla/text"
+import "abla/bytes"
+import "abla/crypto"
+import "../src/msgpack.ab"
+
+var failures = 0
+
+fun check(ok: bool, label: string): void {
+    if (!ok) {
+        println("FAIL " + label)
+        failures += 1
+    }
+    return
+}
+
+fun unhex(h: string): string {
+    val digits = "0123456789abcdef"
+    var out = byteBuffer()
+    var i = 0
+    while (i + 1 < h.size) {
+        out.appendByteValue(digits.indexOf(h.slice(i, i + 1)) * 16 + digits.indexOf(h.slice(i + 1, i + 2)))
+        i += 2
+    }
+    out.toText()
+}
+
+// v encodes to hex, and hex decodes to the same bytes again
+fun fixture(v: MsgpackValue, hex: string, label: string): void {
+    val encoded = msgpackEncodeValue(v)
+    check(hexEncode(encoded) == hex, label + " encode: " + hexEncode(encoded))
+    val decoded = msgpackDecodeValue(unhex(hex))
+    check(decoded.ok && hexEncode(msgpackEncodeValue(decoded.value)) == hex, label + " decode " + decoded.error)
+    return
+}
+
+fun repeat(s: string, n: int): string {
+    var out = byteBuffer()
+    var i = 0
+    while (i < n) {
+        out.appendText(s)
+        i += 1
+    }
+    out.toText()
+}
+
+fun main: int {
+    fixture(msgpackNil(), "c0", "nil")
+    fixture(msgpackBool(false), "c2", "false")
+    fixture(msgpackBool(true), "c3", "true")
+    fixture(msgpackInt(0), "00", "0")
+    fixture(msgpackInt(127), "7f", "positive fixint")
+    fixture(msgpackInt(128), "cc80", "uint8")
+    fixture(msgpackInt(65535), "cdffff", "uint16")
+    fixture(msgpackInt(65536), "ce00010000", "uint32")
+    fixture(msgpackInt(4294967296), "cf0000000100000000", "uint64")
+    fixture(msgpackUint(-1), "cfffffffffffffffff", "uint64 max")
+    fixture(msgpackInt(-1), "ff", "negative fixint")
+    fixture(msgpackInt(-32), "e0", "negative fixint min")
+    fixture(msgpackInt(-33), "d0df", "int8")
+    fixture(msgpackInt(-129), "d1ff7f", "int16")
+    fixture(msgpackInt(-32769), "d2ffff7fff", "int32")
+    fixture(msgpackInt(-2147483649), "d3ffffffff7fffffff", "int64")
+    fixture(msgpackFloat64(0.5), "cb3fe0000000000000", "float64")
+    fixture(msgpackFloat32(1.5), "ca3fc00000", "float32")
+    fixture(msgpackStr(""), "a0", "fixstr empty")
+    fixture(msgpackStr("hé"), "a368c3a9", "fixstr utf-8")
+    fixture(msgpackStr(repeat("x", 32)), "d920" + repeat("78", 32), "str8")
+    fixture(msgpackBin(""), "c400", "bin8 empty")
+    fixture(msgpackBin(unhex("00ff")), "c40200ff", "bin8")
+    fixture(msgpackArray([]), "90", "fixarray empty")
+    fixture(msgpackArray([msgpackInt(1), msgpackStr("a")]), "9201a161", "fixarray")
+    fixture(msgpackMap([msgpackStr("a"), msgpackInt(1)], [msgpackInt(1), msgpackNil()]), "82a1610101c0", "fixmap, int key")
+    fixture(msgpackExt(-1, unhex("00000001")), "d6ff00000001", "fixext4 (timestamp 32)")
+    fixture(msgpackExt(5, unhex("010203")), "c7030501 0203".replace(" ", ""), "ext8")
+
+    // large headers
+    var many: array<MsgpackValue> = []
+    var i = 0
+    while (i < 16) {
+        many.append(msgpackInt(i))
+        i += 1
+    }
+    check(hexEncode(msgpackEncodeValue(msgpackArray(many))).startsWith("dc0010"), "array16")
+    check(hexEncode(msgpackEncodeValue(msgpackStr(repeat("y", 256)))).startsWith("da0100"), "str16")
+    check(hexEncode(msgpackEncodeValue(msgpackBin(repeat("z", 70000)))).startsWith("c600011170"), "bin32")
+
+    // decoded fields
+    val decoded = msgpackDecodeValue(unhex("82a46e616d65a3626f62a16391cfffffffffffffffff"))
+    check(decoded.ok && decoded.value.field("name").text == "bob", "map field")
+    val big = decoded.value.field("c").items[0]
+    check(big.unsigned && big.integer == -1, "uint64 above 2^63 keeps its bits")
+    check(decoded.value.field("missing").isNil(), "missing field is nil")
+
+    // the reader: tokens and skip
+    var r = msgpackReader(unhex("93c3920102a178"))
+    val head = r.next()
+    check(head.kind == MSGPACK_ARRAY && head.count == 3, "array header token")
+    check(r.next().boolean, "bool token")
+    r.skip()
+    check(r.next().text == "x" && r.atEnd(), "skip a nested array")
+
+    // bad input
+    check(!msgpackDecodeValue(unhex("92")).ok, "truncated array")
+    check(!msgpackDecodeValue(unhex("0102")).ok, "extra bytes")
+    check(!msgpackDecodeValue(unhex("c1")).ok, "reserved byte")
+    check(!msgpackDecodeValue(unhex("db7fffffff")).ok, "str32 length past the end")
+    check(!msgpackDecodeValue(repeat(unhex("91"), 600) + unhex("c0")).ok, "depth limit")
+    check(msgpackDecodeValue(repeat(unhex("91"), 100) + unhex("c0")).ok, "depth under the limit")
+
+    if (failures == 0) println("msgpack: all passed")
+    failures
+}
